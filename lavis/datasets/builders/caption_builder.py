@@ -19,6 +19,34 @@ from lavis.datasets.datasets.video_caption_datasets import (
 )
 
 
+@registry.register_builder("cocozh_caption")
+class COCOZhCapBuilder(BaseDatasetBuilder):
+    train_dataset_cls = COCOCapDataset
+
+    DATASET_CONFIG_DICT = {
+        "default": "configs/datasets/cocozh/defaults_cap.yaml",
+    }
+
+
+@registry.register_builder("mepave_caption")
+class MEPAVECapBuilder(BaseDatasetBuilder):
+    train_dataset_cls = COCOCapDataset
+
+    DATASET_CONFIG_DICT = {
+        "default": "configs/datasets/mepave/defaults_cap.yaml",
+    }
+
+
+@registry.register_builder("flickr8k_caption")
+class Flickr8kCapBuilder(BaseDatasetBuilder):
+    train_dataset_cls = COCOCapDataset
+
+    DATASET_CONFIG_DICT = {
+        "default": "configs/datasets/flickr8k/defaults_pretrain_cap.yaml",
+        "pretrain": "configs/datasets/flickr8k/defaults_pretrain_cap.yaml",
+    }
+
+
 @registry.register_builder("coco_caption")
 class COCOCapBuilder(BaseDatasetBuilder):
     train_dataset_cls = COCOCapDataset
