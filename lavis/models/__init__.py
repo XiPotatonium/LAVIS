@@ -36,7 +36,8 @@ from lavis.models.blip2_models.blip2_opt import Blip2OPT
 from lavis.models.blip2_models.blip2_t5 import Blip2T5
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip2_models.blip2_image_text_matching import Blip2ITM
-from lavis.models.blip2_models.blip2_zh import Blip2ZhQformer
+from lavis.models.blip2zh_models.blip2zh_qformer import Blip2ZhQformer
+from lavis.models.blip2zh_models.blip2zh_chatglm import Blip2ZhChatGLM
 
 from lavis.models.pnp_vqa_models.pnp_vqa import PNPVQA
 from lavis.models.pnp_vqa_models.pnp_unifiedqav2_fid import PNPUnifiedQAv2FiD
@@ -72,6 +73,7 @@ __all__ = [
     "BlipVQA",
     "Blip2Qformer",
     "Blip2ZhQformer",
+    "Blip2ZhChatGLM",
     "Blip2Base",
     "Blip2ITM",
     "Blip2OPT",

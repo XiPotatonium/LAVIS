@@ -1,0 +1,99 @@
+# Copyright (c) 2022, salesforce.com, inc.
+ # All rights reserved.
+ # SPDX-License-Identifier: BSD-3-Clause
+ # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+
+model:
+  arch: blip2zh_chatglm
+  model_type: pretrain_chatglm6b
+  vit_model: clip_L
+  load_pretrained: True
+  # intialize stage 2 pretraining from stage 1 pretrained model
+  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230323090/checkpoint_9.pth"
+  freeze_vit: True
+
+  use_prompt: True
+  prompt: "这是一张什么图片？"
+
+
+datasets:
+  cocozh_caption:
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+    build_info:
+      # Be careful not to append minus sign (-) before split to avoid itemizing
+      annotations:
+        train:
+          # 22218
+          url: /home/wsh/data/coco/coco-cn-version1805v1.1/imageid.manually-translated-caption.json
+          storage: coco-cn/annotations/manually-translated-caption.json
+      images:
+        storage: /home/wsh/data/coco/coco-imgs
+  flickr8k_caption:
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+    build_info:
+      # Be careful not to append minus sign (-) before split to avoid itemizing
+      annotations:
+        train:
+          # 40455
+          url: /home/wsh/data/flickr8k/flickr8kzhc.caption.json
+          storage: flickr8k/annotations/zhc.caption.json
+      images:
+        storage: /home/wsh/data/flickr8k/Images
+  mepave_caption:
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+    build_info:
+      # Be careful not to append minus sign (-) before split to avoid itemizing
+      annotations:
+        train:
+          # 71194
+          url: /home/wsh/MultiModalLM/data/MEPAVE/train.json
+          storage: mepave/annotations/train.json
+      images:
+        storage: /home/wsh/MultiModalLM/data/MEPAVE/imgs/product_images
+
+run:
+  task: image_text_pretrain
+  # optimizer
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-4
+  min_lr: 1e-5
+  warmup_lr: 1e-6
+
+  weight_decay: 0.05
+  max_epoch: 10
+  batch_size_train: 16
+  batch_size_eval: 64
+  num_workers: 4
+  warmup_steps: 2000
+
+  seed: 42
+  output_dir: "output/BLIP2/Pretrain_stage2"
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False
+  train_splits: ["train"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True

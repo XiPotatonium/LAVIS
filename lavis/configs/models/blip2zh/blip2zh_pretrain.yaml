@@ -4,10 +4,11 @@
  # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 
 model:
-  arch: pretrain_opt6.7b
+  arch: pretrain
   load_finetuned: False
+  load_pretrained: False
 
-  pretrained: "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained_opt6.7b.pth"
+  pretrained: ""
   finetuned: ""
 
   # vit encoder
@@ -19,12 +20,6 @@ model:
 
   # Q-Former
   num_query_token: 32
-
-  # OPT
-  opt_model: "facebook/opt-6.7b"
-
-  # generation configs
-  prompt: ""
 
 
 preprocess:

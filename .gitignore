@@ -152,5 +152,8 @@ debug*/
 *.dat
 *.tsv
 *.gz
+/.vscode/
 
 cache/
+
+/demo.py

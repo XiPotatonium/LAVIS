@@ -4,10 +4,8 @@ from torch import nn
 import logging
 from torch.cuda.amp import autocast as autocast
 from lavis.common.registry import registry
-from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.common.dist_utils import get_rank
 
-import torch.distributed as dist
 from torch.nn import functional as F
 
 from lavis.models.base_model import all_gather_with_grad, concat_all_gather
@@ -48,10 +46,6 @@ class Blip2BaseZh(Blip2Base):
         query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
         return Qformer, query_tokens
 
-    def load_from_pretrained(self, url_or_filename):
-        logging.info(f"Skip load from pretrained from {url_or_filename}")
-        return {}
-
 
 @registry.register_model("blip2zh")
 class Blip2ZhQformer(Blip2BaseZh):
@@ -67,9 +61,7 @@ class Blip2ZhQformer(Blip2BaseZh):
     """
 
     PRETRAINED_MODEL_CONFIG_DICT = {
-        "pretrain": "configs/models/blip2/blip2_pretrain.yaml",
-        "pretrain_vitL": "configs/models/blip2/blip2_pretrain_vitL.yaml",
-        "coco": "configs/models/blip2/blip2_coco.yaml",
+        "pretrain": "configs/models/blip2zh/blip2zh_pretrain.yaml",
     }
 
     def __init__(
@@ -536,7 +528,17 @@ class Blip2ZhQformer(Blip2BaseZh):
             cross_attention_freq=cross_attention_freq,
             max_txt_len=max_txt_len,
         )
-        model.load_checkpoint_from_config(cfg)
+
+        load_finetuned = cfg.get("load_finetuned", True)
+        load_pretrained = cfg.get("load_pretrained", True)
+        if load_finetuned or load_pretrained:
+            if load_pretrained:
+                logging.info("Load pretrained from {}".format(cfg["pretrained"]))
+            else:
+                logging.info("Load finetuned from {}".format(cfg["fintuned"]))
+            model.load_checkpoint_from_config(cfg)
+        else:
+            logging.info("Learning from scratch")
 
         return model
 
@@ -547,153 +549,3 @@ class Blip2ZhQformer(Blip2BaseZh):
         k_test = task_cfg.k_test
 
         return compute_sim_matrix(model=self, data_loader=data_loader, k_test=k_test)
-
-
-@registry.register_model("blip2_chatglm")
-class Blip2ChatGLM(Blip2BaseZh):
-
-    PRETRAINED_MODEL_CONFIG_DICT = {
-        "pretrain_chatglm-6b": "configs/models/blip2/blip2_pretrain_chatglm-6b.yaml",
-    }
-
-    def __init__(
-        self,
-        vit_model="eva_clip_g",
-        img_size=224,
-        drop_path_rate=0,
-        use_grad_checkpoint=False,
-        vit_precision="fp16",
-        freeze_vit=True,
-        num_query_token=32,
-        lm_model="facebook/opt-2.7b",
-        prompt="",
-        max_txt_len=32,
-    ):
-        super().__init__()
-
-        self.tokenizer = self.init_tokenizer()
-
-        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
-            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        )
-        if freeze_vit:
-            for name, param in self.visual_encoder.named_parameters():
-                param.requires_grad = False
-            self.visual_encoder = self.visual_encoder.eval()
-            self.visual_encoder.train = disabled_train
-            logging.info("freeze vision encoder")
-
-        self.Qformer, self.query_tokens = self.init_Qformer(
-            num_query_token, self.visual_encoder.num_features
-        )
-        self.Qformer.cls = None
-        self.Qformer.bert.embeddings.word_embeddings = None
-        self.Qformer.bert.embeddings.position_embeddings = None
-        for layer in self.Qformer.bert.encoder.layer:
-            layer.output = None
-            layer.intermediate = None
-
-        self.lm_tokenizer = AutoTokenizer.from_pretrained(lm_model, use_fast=False)
-        self.lm_model = AutoModel.from_pretrained(lm_model).half()          # chatglm is half
-        for name, param in self.lm_model.named_parameters():
-            param.requires_grad = False
-        self.eos_token_id = self.lm_tokenizer(
-            "\n", add_special_tokens=False
-        ).input_ids[0]
-
-        self.lm_proj = nn.Linear(
-            self.Qformer.config.hidden_size, self.lm_model.config.hidden_size
-        )
-
-        self.max_txt_len = max_txt_len
-        self.prompt = prompt
-        prompt_tokens = self.lm_tokenizer(self.prompt, return_tensors="pt")
-        self.prompt_length = prompt_tokens.attention_mask.sum(1)
-
-    def forward(self, samples):
-        image = samples["image"]
-        with self.maybe_autocast():
-            image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
-
-        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-        query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-        )
-
-        inputs_opt = self.lm_proj(query_output.last_hidden_state)
-        atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(image.device)
-
-        self.lm_tokenizer.padding_side = "right"
-
-        text = [t + "\n" for t in samples["text_input"]]
-
-        lm_tokens = self.lm_tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-        ).to(image.device)
-
-        targets = lm_tokens.input_ids.masked_fill(
-            lm_tokens.input_ids == self.lm_tokenizer.pad_token_id, -100
-        )
-        if self.prompt:
-            targets[:, : self.prompt_length] = -100  # do not apply loss to the prompt
-
-        empty_targets = (
-            torch.ones(atts_opt.size(), dtype=torch.long).to(image.device).fill_(-100)
-        )
-        targets = torch.cat([empty_targets, targets], dim=1)
-
-        inputs_embeds = self.lm_model.model.decoder.embed_tokens(lm_tokens.input_ids)
-        inputs_embeds = torch.cat([inputs_opt, inputs_embeds], dim=1)
-        attention_mask = torch.cat([atts_opt, lm_tokens.attention_mask], dim=1)
-
-        with self.maybe_autocast():
-            outputs = self.lm_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                return_dict=True,
-                labels=targets,
-            )
-        loss = outputs.loss
-
-        return {"loss": loss}
-
-    @classmethod
-    def from_config(cls, cfg):
-        vit_model = cfg.get("vit_model", "eva_clip_g")
-        img_size = cfg.get("image_size")
-        num_query_token = cfg.get("num_query_token")
-        lm_model = cfg.get("lm_model")
-
-        drop_path_rate = cfg.get("drop_path_rate", 0)
-        use_grad_checkpoint = cfg.get("use_grad_checkpoint", False)
-        vit_precision = cfg.get("vit_precision", "fp16")
-        freeze_vit = cfg.get("freeze_vit", True)
-
-        prompt = cfg.get("prompt", "")
-        max_txt_len = cfg.get("max_txt_len", 32)
-
-        model = cls(
-            vit_model=vit_model,
-            img_size=img_size,
-            drop_path_rate=drop_path_rate,
-            use_grad_checkpoint=use_grad_checkpoint,
-            vit_precision=vit_precision,
-            freeze_vit=freeze_vit,
-            num_query_token=num_query_token,
-            lm_model=lm_model,
-            prompt=prompt,
-            max_txt_len=max_txt_len,
-        )
-        model.load_checkpoint_from_config(cfg)
-
-        return model
