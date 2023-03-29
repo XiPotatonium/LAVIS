@@ -1,19 +1,13 @@
-# Copyright (c) 2022, salesforce.com, inc.
+ # Copyright (c) 2022, salesforce.com, inc.
  # All rights reserved.
  # SPDX-License-Identifier: BSD-3-Clause
  # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 
 model:
-  arch: blip2zh_chatglm
-  model_type: pretrain_chatglm6b
-  vit_model: clip_L
-  load_pretrained: True
-  # intialize stage 2 pretraining from stage 1 pretrained model
-  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230323090/checkpoint_9.pth"
+  arch: blip2zh
+  model_type: pretrain
+  load_pretrained: False
   freeze_vit: True
-
-  use_prompt: True
-  prompt: "这是一张什么图片？"
 
 
 datasets:
@@ -79,13 +73,13 @@ run:
 
   weight_decay: 0.05
   max_epoch: 10
-  batch_size_train: 16
+  batch_size_train: 100
   batch_size_eval: 64
   num_workers: 4
-  warmup_steps: 2000
+  warmup_steps: 5000
 
   seed: 42
-  output_dir: "output/BLIP2/Pretrain_stage2"
+  output_dir: "output/BLIP2/Pretrain_stage1"
 
   amp: True
   resume_ckpt_path: null
@@ -96,4 +90,4 @@ run:
   device: "cuda"
   world_size: 1
   dist_url: "env://"
-  distributed: True
+  distributed: False

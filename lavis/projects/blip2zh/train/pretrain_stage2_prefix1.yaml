@@ -6,11 +6,13 @@
 model:
   arch: blip2zh_chatglm
   model_type: pretrain_chatglm6b
-  vit_model: clip_L
   load_pretrained: True
   # intialize stage 2 pretraining from stage 1 pretrained model
-  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230323090/checkpoint_9.pth"
+  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230328051/checkpoint_9.pth"
   freeze_vit: True
+
+  prompt_mode: "prefix"
+  prompt: "这是一张什么图片？"
 
 
 datasets:

@@ -7,7 +7,7 @@ model:
   arch: pretrain_chatglm6b
   load_finetuned: False
 
-  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230327161/checkpoint_9.pth"
+  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230328133/checkpoint_9.pth"
   finetuned: ""
 
   # vit encoder
@@ -15,7 +15,6 @@ model:
   drop_path_rate: 0
   use_grad_checkpoint: False
   vit_precision: "fp16"
-  vit_model: clip_L
   freeze_vit: True
 
   # Q-Former
@@ -26,7 +25,7 @@ model:
 
   # generation configs
   prompt: ""
-  use_prompt: False
+  prompt_mode: "prefix"
 
 
 preprocess:

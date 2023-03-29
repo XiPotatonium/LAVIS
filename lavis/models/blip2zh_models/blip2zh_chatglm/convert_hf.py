@@ -30,15 +30,13 @@ from PIL import Image
 
 from transformers import (
     AutoTokenizer,
-    Blip2Config,
-    Blip2ForConditionalGeneration,
     Blip2Processor,
     Blip2VisionConfig,
     BlipImageProcessor,
-    OPTConfig,
-    T5Config,
 )
 from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+from .blip2zh_hf import BlipFor2ChatGLM, Blip2ChatGLMConfig
+from .configuration_chatglm import ChatGLMConfig
 
 
 def load_demo_image():
@@ -98,16 +96,16 @@ def read_in_q_v_bias(state_dict, config):
         state_dict[f"vision_model.encoder.layers.{i}.self_attn.qkv.bias"] = qkv_bias
 
 
-def get_blip2_config(model_name, eos_token_id):
-    image_size = 364 if "coco" in model_name else 224
+def get_blip2_config(model_name):
+    image_size = 224
     vision_config = Blip2VisionConfig(image_size=image_size).to_dict()
 
     # make sure the models have proper bos_token_id and eos_token_id set (important for generation)
     # seems like flan-T5 models don't have bos_token_id properly set?
     if "chatglm-6b" in model_name:
-        text_config = OPTConfig.from_pretrained("/home/wsh/models/chatglm-6b", eos_token_id=eos_token_id).to_dict()
+        text_config = ChatGLMConfig.from_pretrained("/home/wsh/models/chatglm-6b").to_dict()
 
-    config = Blip2Config(vision_config=vision_config, text_config=text_config)
+    config = Blip2ChatGLMConfig(vision_config=vision_config, text_config=text_config)
 
     return config, image_size
 
@@ -122,10 +120,9 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
     else:
         raise NotImplementedError()
 
-    eos_token_id = tokenizer("\n", add_special_tokens=False).input_ids[0]
-    config, image_size = get_blip2_config(model_name, eos_token_id=eos_token_id)
+    config, image_size = get_blip2_config(model_name)
 
-    hf_model = Blip2ForConditionalGeneration(config).eval()
+    hf_model = BlipFor2ChatGLM(config).eval()
 
     model_name_to_original = {
         "blip2zh-chatglm-6b": ("blip2zh_chatglm", "pretrain_chatglm6b"),
@@ -165,12 +162,15 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
     read_in_q_v_bias(state_dict, config)
 
     missing_keys, unexpected_keys = hf_model.load_state_dict(state_dict, strict=False)
-    assert len(missing_keys) == 0
-    assert unexpected_keys == ["qformer.embeddings.position_ids"]
+    assert len(missing_keys) == 0, missing_keys
+    for unexpected_key in unexpected_keys:
+        if unexpected_key == "qformer.embeddings.position_ids" or unexpected_key.startswith("language"):
+            pass
+        else:
+            raise ValueError(f"Unexpected key: {unexpected_key}")
 
     image = load_demo_image()
     original_pixel_values = vis_processors["eval"](image).unsqueeze(0).to(device)
-    input_ids = tokenizer(["\n"], return_tensors="pt").input_ids.to(device)
 
     # create processor
     image_processor = BlipImageProcessor(
@@ -184,67 +184,36 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
 
     original_model.to(device)
     hf_model.to(device)
-    with torch.no_grad():
-        if "opt" in model_name:
-            original_logits = original_model({"image": original_pixel_values, "text_input": [""]}).logits
-            logits = hf_model(original_pixel_values, input_ids).logits
-        else:
-            original_logits = original_model(
-                {"image": original_pixel_values, "text_input": ["\n"], "text_output": ["\n"]}
-            ).logits
-            labels = input_ids.masked_fill(input_ids == tokenizer.pad_token_id, -100)
-            logits = hf_model(original_pixel_values, input_ids, labels=labels).logits
+    # since lm is freezed, we only assert vtokens are all close
+    with torch.cuda.amp.autocast(enabled=True):
+        original_vtokens = original_model({"image": original_pixel_values, "text_input": [""]})["vtokens"]
+    _, _, vtokens = hf_model(pixel_values=original_pixel_values)
 
-    assert original_logits.shape == logits.shape
-    print("First values of original logits:", original_logits[0, :3, :3])
-    print("First values of HF logits:", logits[0, :3, :3])
+    assert original_vtokens.shape == vtokens.shape
+    print("First values of original vtokens:", original_vtokens[0, :3, :3])
+    print("First values of HF logits:", vtokens[0, :3, :3])
 
     # assert values
-    if model_name == "blip2-flan-t5-xl":
-        expected_slice_logits = torch.tensor(
-            [[-41.5850, -4.4440, -8.9922], [-47.4322, -5.9143, -1.7340]], device=device
-        )
-        assert torch.allclose(logits[0, :3, :3], expected_slice_logits, atol=1e-4)
-    elif model_name == "blip2-flan-t5-xl-coco":
-        expected_slice_logits = torch.tensor(
-            [[-57.0109, -9.8967, -12.6280], [-68.6578, -12.7191, -10.5065]], device=device
-        )
-    else:
-        # cast to same type
-        target_dtype = logits.dtype
-        assert torch.allclose(original_logits.to(target_dtype), logits, atol=1e-2)
+    target_dtype = vtokens.dtype
+    assert torch.allclose(original_vtokens.to(target_dtype), vtokens, atol=1e-2)
     print("Looks ok!")
 
     print("Generating a caption...")
-    prompt = ""
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-    original_outputs = original_model.generate({"image": original_pixel_values})
-    outputs = hf_model.generate(
-        original_pixel_values,
-        input_ids,
-        do_sample=False,
-        num_beams=5,
-        max_length=30,
-        min_length=1,
-        top_p=0.9,
-        repetition_penalty=1.0,
-        length_penalty=1.0,
-        temperature=1,
-    )
-    print("Original generation:", original_outputs)
-    prompt_length = input_ids.shape[1]
-    output_text = processor.batch_decode(outputs[:, prompt_length:], skip_special_tokens=True)
-    output_text = [text.strip() for text in output_text]
-    print("HF generation:", output_text)
+    with torch.cuda.amp.autocast(enabled=True):
+        # for response, history in original_model.generate("这是一张什么图片？", history=[], max_length=128):
+        #     print(response)
+        for response, history in original_model.stream_generate(
+            ("这是一张什么图片？", original_pixel_values), history=[], max_length=128
+        ):
+            print(response)
 
     if pytorch_dump_folder_path is not None:
         processor.save_pretrained(pytorch_dump_folder_path)
         hf_model.save_pretrained(pytorch_dump_folder_path)
 
-    if push_to_hub:
-        processor.push_to_hub(f"nielsr/{model_name}")
-        hf_model.push_to_hub(f"nielsr/{model_name}")
+    # if push_to_hub:
+    #     processor.push_to_hub(f"nielsr/{model_name}")
+    #     hf_model.push_to_hub(f"nielsr/{model_name}")
 
 
 if __name__ == "__main__":
