@@ -7,7 +7,7 @@ model:
   arch: pretrain_chatglm6b
   load_finetuned: False
 
-  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230328133/checkpoint_9.pth"
+  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230404210/checkpoint_115000.pth"
   finetuned: ""
 
   # vit encoder

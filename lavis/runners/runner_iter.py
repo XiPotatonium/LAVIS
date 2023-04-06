@@ -244,7 +244,7 @@ class RunnerIter(RunnerBase):
                     )
 
                 dataset_ratios = [float(dataset_ratios[k]) for k in self.datasets]
-                self.datasets = reorg_datasets_by_split(self.datasets)
+                datasets = reorg_datasets_by_split(self.datasets)
                 # to keep the same structure as return value of concat_datasets
                 self.datasets = {
                     k: v[0] if len(v) == 1 else v for k, v in datasets.items()

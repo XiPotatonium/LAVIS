@@ -12,7 +12,7 @@ model:
   freeze_vit: True
 
   prompt_mode: "prefix"
-  prompt: "这是一张什么图片？"
+  prompt: ["这张图的内容是什么？", "这张图的内容是"]
 
 
 datasets:
@@ -63,10 +63,10 @@ datasets:
       annotations:
         train:
           # 71194
-          url: /home/wsh/MultiModalLM/data/MEPAVE/train.json
+          url: /home/wsh/data/MEPAVE/jdair.jave.train.json
           storage: mepave/annotations/train.json
       images:
-        storage: /home/wsh/MultiModalLM/data/MEPAVE/imgs/product_images
+        storage: /home/wsh/data/MEPAVE/product_images
 
 run:
   task: image_text_pretrain

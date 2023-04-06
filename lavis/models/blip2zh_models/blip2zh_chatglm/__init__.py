@@ -1,6 +1,5 @@
 from typing import List, Tuple, Union
 import numpy as np
-from transformers import AutoTokenizer, AutoConfig, AutoModel
 import torch
 from torch import nn
 import logging
@@ -12,6 +11,7 @@ from lavis.models.blip2_models.blip2 import (
 )
 from lavis.models.blip2zh_models.blip2zh_qformer import Blip2BaseZh
 from .modeling_chatglm import ChatGLMForConditionalGeneration, InvalidScoreLogitsProcessor
+from .tokenization_chatglm import ChatGLMTokenizer
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -35,7 +35,7 @@ class Blip2ZhChatGLM(Blip2BaseZh):
         lm_model="chatglm-6b",
         prompt="",
         prompt_mode="None",
-        max_txt_len=32,
+        max_txt_len=128,
     ):
         super().__init__()
 
@@ -61,7 +61,7 @@ class Blip2ZhChatGLM(Blip2BaseZh):
             layer.output = None
             layer.intermediate = None
 
-        self.lm_tokenizer = AutoTokenizer.from_pretrained(lm_model, use_fast=False, trust_remote_code=True)
+        self.lm_tokenizer = ChatGLMTokenizer.from_pretrained(lm_model, use_fast=False, trust_remote_code=True)
         self.lm_model = ChatGLMForConditionalGeneration.from_pretrained(lm_model).half()          # chatglm is half
         for name, param in self.lm_model.named_parameters():
             param.requires_grad = False
@@ -76,12 +76,23 @@ class Blip2ZhChatGLM(Blip2BaseZh):
         self.max_txt_len = max_txt_len
         self.prompt = prompt
         self.prompt_mode = prompt_mode
-        if self.prompt_mode == "None":
-            pass
-        elif self.prompt_mode == "prefix":
-            logging.info(f"Use prompt: <vtokens>{self.prompt}<captions>")
+        if self.prompt_mode == "prefix":
+            if isinstance(self.prompt, str):
+                logging.info(f"Use prompt: <vtokens>{self.prompt}<captions>")
+            elif isinstance(self.prompt, list):
+                # list of size 2
+                p1, p2 = self.prompt
+                logging.info(f"Use prompt: <vtokens>{p1}\n{p2}<captions>")
+            else:
+                raise ValueError(f"Invalid prompt: {self.prompt}")
         elif self.prompt_mode == "chat":
-            logging.info(f"Use prompt: [Round 0]\n问：<vtokens>{self.prompt}\n答：<captions>")
+            if isinstance(self.prompt, str):
+                logging.info(f"Use prompt: [Round 0]\n问：<vtokens>{self.prompt}\n答：<captions>")
+            elif isinstance(self.prompt, list):
+                p1, p2 = self.prompt
+                logging.info(f"Use prompt: [Round 0]\n问：<vtokens>{p1}\n答：{p2}<captions>")
+            else:
+                raise ValueError(f"Invalid prompt: {self.prompt}")
         else:
             raise ValueError(f"Invalid prompt_mode: {self.prompt_mode}")
 
@@ -89,12 +100,61 @@ class Blip2ZhChatGLM(Blip2BaseZh):
         bsz, nvtoken, _ = vtokens.size()
         MASK, gMASK = 150000, 150001
 
+        if self.prompt_mode == "prefix":
+            if isinstance(self.prompt, str):
+                p1 = self.lm_tokenizer(self.prompt, return_tensors="pt").input_ids.to(self.device)
+                p2 = None
+            else:
+                # <vtokens><p1><p2><captions>
+                p1 = self.lm_tokenizer(self.prompt[0], return_tensors="pt").input_ids.to(self.device)
+                p2 = self.lm_tokenizer(self.prompt[1], add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+            assert p1[0][-1] == self.lm_model.config.bos_token_id, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p1)}"
+            assert p1[0][-2] == gMASK, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p1)}"
+            prefix_embeds = torch.cat(
+                [vtokens, self.lm_model.transformer.word_embeddings(p1).expand(bsz, -1, -1)] if p2 is None else [
+                    vtokens,
+                    self.lm_model.transformer.word_embeddings(p1).expand(bsz, -1, -1),
+                    self.lm_model.transformer.word_embeddings(p2).expand(bsz, -1, -1),
+                ], dim=1
+            )
+        elif self.prompt_mode == "chat":
+            if isinstance(self.prompt, str):
+                # [Round 0]\n问：<vtokens><p1>\n答：<captions>
+                p0 = self.lm_tokenizer("[Round 0]\n问：", add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+                p1 = self.lm_tokenizer(f"{self.prompt}\n答：", return_tensors="pt").input_ids.to(self.device)
+                p2 = None
+            else:
+                # [Round 0]\n问：<vtokens><p1>\n答：<p2><captions>
+                p0 = self.lm_tokenizer("[Round 0]\n问：", add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+                p1 = self.lm_tokenizer(f"{self.prompt[0]}\n答：", return_tensors="pt").input_ids.to(self.device)
+                if len(self.prompt[1]) != 0:
+                    p2 = self.lm_tokenizer(self.prompt[1], add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
+                else:
+                    p2 = None
+            assert p1[0][-1] == self.lm_model.config.bos_token_id, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p1)}"
+            assert p1[0][-2] == gMASK, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p1)}"
+            prefix_embeds = torch.cat([
+                self.lm_model.transformer.word_embeddings(p0).expand(bsz, -1, -1), vtokens,
+                self.lm_model.transformer.word_embeddings(p1).expand(bsz, -1, -1)
+            ] if p2 is None else [
+                self.lm_model.transformer.word_embeddings(p0).expand(bsz, -1, -1), vtokens,
+                self.lm_model.transformer.word_embeddings(p1).expand(bsz, -1, -1),
+                self.lm_model.transformer.word_embeddings(p2).expand(bsz, -1, -1)
+            ], dim=1)
+        else:
+            raise ValueError(f"Unknown prompt mode: {self.prompt_mode}")
+        prefix_length = prefix_embeds.size(1)
+
+        # 注意正常情况下inference的tokenizer padding是在左边，因为要保证最后一个用于推理下一个
+        # 但训练中不需要这样，因为只会做一次forward，padding在右边处理起来更方便
+        self.lm_tokenizer.padding_side = "right"
         cap_tokens = self.lm_tokenizer(
             [t + "</s>" for t in captions],
             return_tensors="pt",
             padding="longest",
             truncation=True,
-            max_length=self.max_txt_len,            # TODO: 应该减去prompt还有vtoken
+            max_length=self.max_txt_len - prefix_length,
+            add_special_tokens=False,
         ).to(self.device).input_ids
 
         seq_lengths = np.zeros(bsz, dtype=int)
@@ -104,7 +164,11 @@ class Blip2ZhChatGLM(Blip2BaseZh):
         # TODO: which one is correct eos?
         for i, ids in enumerate(cap_tokens):
             ids_list = ids.tolist()
-            eos_position = ids_list.index(tokenizer_eos_id)
+            try:
+                eos_position = ids_list.index(tokenizer_eos_id)
+            except ValueError:
+                # might be truncated due length
+                eos_position = len(ids_list) - 1
             ids[eos_position] = eos_id
             seq_lengths[i] = eos_position + 1
             # <context><gMASK><bos><caption><eos>
@@ -115,39 +179,9 @@ class Blip2ZhChatGLM(Blip2BaseZh):
             cap_tokens == self.lm_tokenizer.pad_token_id, -100
         )
 
-        if self.prompt_mode == "None":
-            # <vtokens><captions>
-            inputs_embeds = torch.cat([vtokens, cap_embeds], dim=1)
-            prefix_targets = (
-                # do not apply loss to the prompt or vtokens
-                torch.ones((bsz, nvtoken), dtype=torch.long).to(self.device).fill_(-100)
-            )
-        elif self.prompt_mode == "prefix":
-            # <vtokens><prompt><captions>
-            p = self.lm_tokenizer(self.prompt, return_tensors="pt").input_ids.to(self.device)
-            assert p[0][-1] == self.lm_model.config.bos_token_id, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p)}"
-            assert p[0][-2] == gMASK, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p)}"
-            inputs_embeds = torch.cat([
-                vtokens, self.lm_model.transformer.word_embeddings(p).expand(bsz, -1, -1), cap_embeds
-            ], dim=1)
-            # do not apply loss to the prompt or vtokens
-            prefix_targets = torch.ones((bsz, nvtoken + len(p[0])), dtype=torch.long).to(self.device).fill_(-100)
-        elif self.prompt_mode == "chat":
-            # [Round 0]\n问：<vtokens><prompt>\n答：<captions>
-            p1 = self.lm_tokenizer("[Round 0]\n问：", add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)
-            p2 = self.lm_tokenizer(f"{self.prompt}\n答：", return_tensors="pt").input_ids.to(self.device)
-            assert p2[0][-1] == self.lm_model.config.bos_token_id, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p2)}"
-            assert p2[0][-2] == gMASK, f"prompt should end with <gMASK><bos>, but got {self.lm_tokenizer.convert_ids_to_tokens(p2)}"
-            inputs_embeds = torch.cat([
-                self.lm_model.transformer.word_embeddings(p1).expand(bsz, -1, -1), vtokens,
-                self.lm_model.transformer.word_embeddings(p2).expand(bsz, -1, -1), cap_embeds
-            ], dim=1)
-            # do not apply loss to the prompt or vtokens
-            prefix_targets = torch.ones((bsz, len(p1[0]) + nvtoken + len(p2[0])), dtype=torch.long).to(self.device).fill_(-100)
-        else:
-            raise ValueError(f"Unknown prompt mode: {self.prompt_mode}")
-
-        prefix_length = prefix_targets.size(1)
+        inputs_embeds = torch.cat([prefix_embeds, cap_embeds], dim=1)
+        # do not apply loss to the prompt or vtokens
+        prefix_targets = torch.ones((bsz, prefix_length), dtype=torch.long).to(self.device).fill_(-100)
         targets = torch.cat([prefix_targets, cap_targets], dim=1)
         return inputs_embeds, targets, seq_lengths + prefix_length, prefix_length
 
@@ -169,10 +203,6 @@ class Blip2ZhChatGLM(Blip2BaseZh):
         vtokens = self.lm_proj(query_output.last_hidden_state)
         bsz, nvtoken, _ = vtokens.size()
         # atts_vtokens = torch.ones((bsz, nvtoken), dtype=torch.long).to(device)
-
-        # 注意正常情况下inference的tokenizer padding是在左边，因为要保证最后一个用于推理下一个
-        # 但训练中不需要这样，因为只会做一次forward，padding在右边处理起来更方便
-        self.lm_tokenizer.padding_side = "right"
 
         inputs_embeds, targets, seq_lengths, prefix_length = self.prepare_lm_input(
             vtokens=vtokens, captions=samples["text_input"]

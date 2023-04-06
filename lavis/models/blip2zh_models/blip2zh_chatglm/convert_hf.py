@@ -21,6 +21,7 @@ URL: https://github.com/salesforce/LAVIS/tree/main/projects/blip2
 import argparse
 
 import requests
+import rich
 import torch
 
 # pip3 install salesforce-lavis
@@ -108,6 +109,22 @@ def get_blip2_config(model_name):
     config = Blip2ChatGLMConfig(vision_config=vision_config, text_config=text_config)
 
     return config, image_size
+
+
+def count_parameters(model):
+    from rich.table import Table
+    table = Table(title="Params")
+    table.add_column("Name", style="dim", no_wrap=True)
+    table.add_column("Params", justify="right")
+    total_params = 0
+
+    for name, parameter in model.named_parameters():
+        # if not parameter.requires_grad: continue
+        params = parameter.numel()
+        table.add_row(name, str(params))
+        total_params += params
+
+    return table, total_params
 
 
 @torch.no_grad()
@@ -210,6 +227,11 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
     if pytorch_dump_folder_path is not None:
         processor.save_pretrained(pytorch_dump_folder_path)
         hf_model.save_pretrained(pytorch_dump_folder_path)
+
+    params, total_size = count_parameters(hf_model)
+    rich.print(params)
+    rich.print(f"Total size: {total_size}")
+
 
     # if push_to_hub:
     #     processor.push_to_hub(f"nielsr/{model_name}")

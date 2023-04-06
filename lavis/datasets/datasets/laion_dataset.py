@@ -52,11 +52,11 @@ if __name__ == "__main__":
     dataset = LaionDataset(
         vis_processor=transform_train,
         text_processor=lambda x: x,
-        location="/export/laion/laion2B-multi/part-00000/{00000..01743}.tar",
+        location="/home/wsh/data/laion/laion2b_chinese_release/sim0.4/{00000..00023}.tar",
     )
 
     import torch
 
-    loader = torch.utils.data.DataLoader(dataset.inner_dataset, batch_size=2)
+    loader = torch.utils.data.DataLoader(dataset.inner_dataset, batch_size=16)
 
     print(next(iter(loader))["text_input"])

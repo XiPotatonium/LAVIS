@@ -8,14 +8,26 @@ model:
   model_type: pretrain_chatglm6b
   load_pretrained: True
   # intialize stage 2 pretraining from stage 1 pretrained model
-  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230328051/checkpoint_9.pth"
+  pretrained: "lavis/output/BLIP2/Pretrain_stage1/20230404111/checkpoint_14000.pth"
   freeze_vit: True
 
   prompt_mode: "prefix"
   prompt: ""
+  max_txt_len: 96    # 128 will cause oovm
 
 
 datasets:
+  laion2B_multi:
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 224
+    text_processor:
+        train:
+          name: "blip_caption"
+    build_info:
+      # 672183
+      storage: /home/wsh/data/laion/laion2b_chinese_release/sim0.34/{00000..00018}.tar
   cocozh_caption:
     vis_processor:
         train:
@@ -50,25 +62,34 @@ datasets:
           storage: flickr8k/annotations/zhc.caption.json
       images:
         storage: /home/wsh/data/flickr8k/Images
-  mepave_caption:
-    vis_processor:
-        train:
-          name: "blip2_image_train"
-          image_size: 224
-    text_processor:
-        train:
-          name: "blip_caption"
-    build_info:
-      # Be careful not to append minus sign (-) before split to avoid itemizing
-      annotations:
-        train:
-          # 71194
-          url: /home/wsh/MultiModalLM/data/MEPAVE/train.json
-          storage: mepave/annotations/train.json
-      images:
-        storage: /home/wsh/MultiModalLM/data/MEPAVE/imgs/product_images
+  # mepave_caption:
+  #   vis_processor:
+  #       train:
+  #         name: "blip2_image_train"
+  #         image_size: 224
+  #   text_processor:
+  #       train:
+  #         name: "blip_caption"
+  #   build_info:
+  #     # Be careful not to append minus sign (-) before split to avoid itemizing
+  #     annotations:
+  #       train:
+  #         # 71194
+  #         url: /home/wsh/data/MEPAVE/jdair.jave.train.json
+  #         storage: mepave/annotations/train.json
+  #     images:
+  #       storage: /home/wsh/data/MEPAVE/product_images
 
 run:
+  runner: runner_iter
+  iters_per_inner_epoch: 11500          # n_samples / bsz / world_size
+  max_iters: 115000                     # iters_per_inner_epoch * max_epoch
+  # max_epoch: 10
+  train_dataset_ratios:
+    laion2B_multi: 672183
+    cocozh_caption: 22218
+    flickr8k_caption: 40455
+
   task: image_text_pretrain
   # optimizer
   lr_sched: "linear_warmup_cosine_lr"
@@ -77,11 +98,10 @@ run:
   warmup_lr: 1e-6
 
   weight_decay: 0.05
-  max_epoch: 10
   batch_size_train: 16
   batch_size_eval: 64
   num_workers: 4
-  warmup_steps: 2000
+  warmup_steps: 8000
 
   seed: 42
   output_dir: "output/BLIP2/Pretrain_stage2"
