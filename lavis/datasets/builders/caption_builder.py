@@ -42,8 +42,10 @@ class Flickr8kCapBuilder(BaseDatasetBuilder):
     train_dataset_cls = COCOCapDataset
 
     DATASET_CONFIG_DICT = {
-        "default": "configs/datasets/flickr8k/defaults_pretrain_cap.yaml",
-        "pretrain": "configs/datasets/flickr8k/defaults_pretrain_cap.yaml",
+        "default": "configs/datasets/flickr8k/pretrain_cap_zhc.yaml",
+        "pretrain_zhc": "configs/datasets/flickr8k/pretrain_cap_zhc.yaml",
+        "pretrain_zhb": "configs/datasets/flickr8k/pretrain_cap_zhb.yaml",
+        "pretrain_zhg": "configs/datasets/flickr8k/pretrain_cap_zhg.yaml",
     }
 
 

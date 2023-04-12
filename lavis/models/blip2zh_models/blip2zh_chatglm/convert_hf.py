@@ -220,7 +220,7 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
         # for response, history in original_model.generate("这是一张什么图片？", history=[], max_length=128):
         #     print(response)
         for response, history in original_model.stream_generate(
-            ("这是一张什么图片？", original_pixel_values), history=[], max_length=128
+            ("这张图的内容是什么？", original_pixel_values), history=[], max_length=128
         ):
             print(response)
 
@@ -228,9 +228,9 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
         processor.save_pretrained(pytorch_dump_folder_path)
         hf_model.save_pretrained(pytorch_dump_folder_path)
 
-    params, total_size = count_parameters(hf_model)
-    rich.print(params)
-    rich.print(f"Total size: {total_size}")
+    # params, total_size = count_parameters(hf_model)
+    # rich.print(params)
+    # rich.print(f"Total size: {total_size}")
 
 
     # if push_to_hub:

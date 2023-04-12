@@ -37,8 +37,8 @@ datasets:
       annotations:
         train:
           # 22218
-          url: /home/wsh/data/coco/coco-cn-version1805v1.1/imageid.manually-translated-caption.json
-          storage: coco-cn/annotations/manually-translated-caption.json
+          url: /home/wsh/data/coco/coco-cn-version1805v1.1/imageid.human-written-caption.json
+          storage: coco-cn/annotations/imageid.human-written-caption.json
       images:
         storage: /home/wsh/data/coco/coco-imgs
   flickr8k_caption:

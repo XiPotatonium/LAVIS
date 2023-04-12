@@ -7,7 +7,7 @@ model:
   arch: pretrain_chatglm6b
   load_finetuned: False
 
-  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230404210/checkpoint_115000.pth"
+  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230411095/checkpoint_37500.pth"
   finetuned: ""
 
   # vit encoder
@@ -24,8 +24,6 @@ model:
   lm_model: "/home/wsh/models/chatglm-6b"
 
   # generation configs
-  prompt: ""
-  prompt_mode: "prefix"
 
 
 preprocess:

@@ -4,7 +4,7 @@
  # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 
 datasets:
-  cocozh_caption: # name of the dataset builder
+  flickr8k_caption: # name of the dataset builder
     dataset_card: dataset_card/coco_caption.md
     # data_dir: ${env.data_dir}/datasets
     data_type: images # [images|videos|features]
@@ -13,7 +13,7 @@ datasets:
       # Be careful not to append minus sign (-) before split to avoid itemizing
       annotations:
         train:
-          # url: data/coco/coco-cn-version1805v1.1/imageid.human-written-caption.json
-          storage: coco-cn/annotations/imageid.human-written-caption.json
+          # url: data/flickr8k/flickr8kzhb.caption.json
+          storage: flickr8k/annotations/zhb.caption.json
       images:
-        # storage: data/coco/coco-imgs
+        # storage: data/flickr8k/Images
