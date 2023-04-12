@@ -36,7 +36,8 @@ from transformers import (
     BlipImageProcessor,
 )
 from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
-from .blip2zh_hf import BlipFor2ChatGLM, Blip2ChatGLMConfig
+from .configuration_blip2chatglm import Blip2ChatGLMConfig
+from .modeling_blip2chatglm import Blip2ForChatGLM
 from .configuration_chatglm import ChatGLMConfig
 
 
@@ -139,7 +140,7 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
 
     config, image_size = get_blip2_config(model_name)
 
-    hf_model = BlipFor2ChatGLM(config).eval()
+    hf_model = Blip2ForChatGLM(config).eval()
 
     model_name_to_original = {
         "blip2zh-chatglm-6b": ("blip2zh_chatglm", "pretrain_chatglm6b"),
