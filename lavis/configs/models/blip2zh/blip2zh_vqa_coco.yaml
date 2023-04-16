@@ -4,11 +4,11 @@
  # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 
 model:
-  arch: pretrain_chatglm6b
-  load_finetuned: False
+  arch: vqa
+  load_finetuned: True
 
-  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230414233/checkpoint_37500.pth"
-  finetuned: ""
+  pretrained: "lavis/output/BLIP2/Pretrain_stage2/20230411095/checkpoint_37500.pth"
+  finetuned: "lavis/output/BLIP2/vqa_ft/20230413235/checkpoint_4.pth"
 
   # vit encoder
   image_size: 224

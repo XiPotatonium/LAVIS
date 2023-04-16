@@ -153,6 +153,7 @@ debug*/
 *.tsv
 *.gz
 /.vscode/
+/models/
 
 cache/
 

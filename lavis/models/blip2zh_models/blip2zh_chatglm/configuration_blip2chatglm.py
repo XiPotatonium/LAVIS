@@ -49,7 +49,7 @@ class Blip2ChatGLMConfig(PretrainedConfig):
         self.num_query_tokens = num_query_tokens
         self.qformer_config.encoder_hidden_size = self.vision_config.hidden_size
         # self.use_decoder_only_language_model = self.text_config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-        self.use_decoder_only_language_model = False    # chatglm is an encoder-decoder model
+        self.use_decoder_only_language_model = True             # chatglm has no encoder
         self.initializer_factor = 1.0
         self.initializer_range = 0.02
 

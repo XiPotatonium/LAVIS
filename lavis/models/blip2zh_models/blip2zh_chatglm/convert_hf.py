@@ -19,6 +19,9 @@ URL: https://github.com/salesforce/LAVIS/tree/main/projects/blip2
 """
 
 import argparse
+import json
+from pathlib import Path
+import shutil
 
 import requests
 import rich
@@ -37,7 +40,7 @@ from transformers import (
 )
 from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from .configuration_blip2chatglm import Blip2ChatGLMConfig
-from .modeling_blip2chatglm import Blip2ForChatGLM
+from .modeling_blip2chatglm import Blip2ChatGLMForConditionalGeneration
 from .configuration_chatglm import ChatGLMConfig
 
 
@@ -94,18 +97,24 @@ def read_in_q_v_bias(state_dict, config):
         v_bias = state_dict.pop(f"visual_encoder.blocks.{i}.attn.v_bias")
 
         # next, set bias in the state dict
-        qkv_bias = torch.cat((q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias))
+        qkv_bias = torch.cat(
+            (q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias)
+        )
         state_dict[f"vision_model.encoder.layers.{i}.self_attn.qkv.bias"] = qkv_bias
 
 
 def get_blip2_config(model_name):
     image_size = 224
-    vision_config = Blip2VisionConfig(image_size=image_size).to_dict()
+    vision_config = Blip2VisionConfig(
+        image_size=image_size, torch_dtype="float16"
+    ).to_dict()
 
     # make sure the models have proper bos_token_id and eos_token_id set (important for generation)
     # seems like flan-T5 models don't have bos_token_id properly set?
     if "chatglm-6b" in model_name:
-        text_config = ChatGLMConfig.from_pretrained("/home/wsh/models/chatglm-6b").to_dict()
+        text_config = ChatGLMConfig.from_pretrained(
+            "/home/wsh/models/chatglm-6b"
+        ).to_dict()
 
     config = Blip2ChatGLMConfig(vision_config=vision_config, text_config=text_config)
 
@@ -114,6 +123,7 @@ def get_blip2_config(model_name):
 
 def count_parameters(model):
     from rich.table import Table
+
     table = Table(title="Params")
     table.add_column("Name", style="dim", no_wrap=True)
     table.add_column("Params", justify="right")
@@ -129,21 +139,24 @@ def count_parameters(model):
 
 
 @torch.no_grad()
-def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_to_hub=False):
+def convert_blip2zh_checkpoint(
+    model_name, pytorch_dump_folder_path=None, push_to_hub=False
+):
     """
     Copy/paste/tweak model's weights to Transformers design.
     """
     if "chatglm-6b" in model_name:
-        tokenizer = AutoTokenizer.from_pretrained("/home/wsh/models/chatglm-6b", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            "/home/wsh/models/chatglm-6b", trust_remote_code=True
+        )
     else:
         raise NotImplementedError()
 
     config, image_size = get_blip2_config(model_name)
 
-    hf_model = Blip2ForChatGLM(config).eval()
-
     model_name_to_original = {
         "blip2zh-chatglm-6b": ("blip2zh_chatglm", "pretrain_chatglm6b"),
+        "blip2zh-chatglm-6b-vqa": ("blip2zh_chatglm", "vqa"),
     }
 
     name, type = model_name_to_original[model_name]
@@ -173,16 +186,18 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
         if key.startswith("lm_proj"):
             key = key.replace("lm_proj", "language_projection")
         if key.startswith("lm_model"):
-            key = key.replace("lm_model", "language")
+            key = key.replace("lm_model", "language_model")
         state_dict[key] = val
 
     # read in qv biases
     read_in_q_v_bias(state_dict, config)
 
+    hf_model = Blip2ChatGLMForConditionalGeneration(config)
+    hf_model.setup_dtype(vision_encoder_dtype="fp16", lm_dtype="fp16")
     missing_keys, unexpected_keys = hf_model.load_state_dict(state_dict, strict=False)
     assert len(missing_keys) == 0, missing_keys
     for unexpected_key in unexpected_keys:
-        if unexpected_key == "qformer.embeddings.position_ids" or unexpected_key.startswith("language"):
+        if unexpected_key == "qformer.embeddings.position_ids":
             pass
         else:
             raise ValueError(f"Unexpected key: {unexpected_key}")
@@ -192,7 +207,9 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
 
     # create processor
     image_processor = BlipImageProcessor(
-        size={"height": image_size, "width": image_size}, image_mean=OPENAI_CLIP_MEAN, image_std=OPENAI_CLIP_STD
+        size={"height": image_size, "width": image_size},
+        image_mean=OPENAI_CLIP_MEAN,
+        image_std=OPENAI_CLIP_STD,
     )
     processor = Blip2Processor(image_processor=image_processor, tokenizer=tokenizer)
     pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
@@ -201,38 +218,87 @@ def convert_blip2zh_checkpoint(model_name, pytorch_dump_folder_path=None, push_t
     assert torch.allclose(pixel_values, original_pixel_values)
 
     original_model.to(device)
+    hf_model.eval()
     hf_model.to(device)
     # since lm is freezed, we only assert vtokens are all close
-    with torch.cuda.amp.autocast(enabled=True):
-        original_vtokens = original_model({"image": original_pixel_values, "text_input": [""]})["vtokens"]
-    _, _, vtokens = hf_model(pixel_values=original_pixel_values)
+    with torch.cuda.amp.autocast(enabled=True), torch.no_grad():
+        original_logits = original_model(
+            {"image": original_pixel_values, "text_input": [""]}
+        )["logits"]
+        a_ids = tokenizer.encode("", add_special_tokens=False)
+        b_ids = tokenizer.encode("", add_special_tokens=False)
+        input_ids = tokenizer.build_inputs_with_special_tokens(a_ids, b_ids)
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
+        input_ids = torch.cat(
+            [
+                torch.ones(
+                    (1, hf_model.config.num_query_tokens),
+                    dtype=input_ids.dtype,
+                    device=device,
+                )
+                * tokenizer.unk_token_id,
+                input_ids,
+            ],
+            dim=1,
+        )
+        logits = hf_model(pixel_values, input_ids).logits
 
-    assert original_vtokens.shape == vtokens.shape
-    print("First values of original vtokens:", original_vtokens[0, :3, :3])
-    print("First values of HF logits:", vtokens[0, :3, :3])
+    assert original_logits.shape == logits.shape, f"{original_logits.shape} vs {logits.shape}"
+    print("First values of original logits:", original_logits[0, :3, :3])
+    print("First values of HF logits:", logits[0, :3, :3])
+    print("Last values of original logits:", original_logits[0, -3:, -3:])
+    print("Last values of HF logits:", logits[0, -3:, -3:])
 
     # assert values
-    target_dtype = vtokens.dtype
-    assert torch.allclose(original_vtokens.to(target_dtype), vtokens, atol=1e-2)
+    target_dtype = logits.dtype
+    assert torch.allclose(original_logits.to(target_dtype), logits, atol=5e-2)
     print("Looks ok!")
 
     print("Generating a caption...")
     with torch.cuda.amp.autocast(enabled=True):
-        # for response, history in original_model.generate("这是一张什么图片？", history=[], max_length=128):
-        #     print(response)
-        for response, history in original_model.stream_generate(
-            ("这张图的内容是什么？", original_pixel_values), history=[], max_length=128
+        #    for response, history in original_model.generate("这是一张什么图片？", history=[], max_length=128):
+        #        print(response)
+        for response in hf_model.stream_chat(
+            tokenizer, ("描述一下这张图", original_pixel_values), history=[]
         ):
             print(response)
 
     if pytorch_dump_folder_path is not None:
+        # store chatglm tokenizer
         processor.save_pretrained(pytorch_dump_folder_path)
-        hf_model.save_pretrained(pytorch_dump_folder_path)
+        # store Blip2ChatGLM
+        hf_model.save_pretrained(pytorch_dump_folder_path, max_shard_size="2GB")
 
-    # params, total_size = count_parameters(hf_model)
+    pytorch_dump_folder_path = Path(pytorch_dump_folder_path)
+    with (pytorch_dump_folder_path / "config.json").open("r", encoding="utf8") as rf:
+        config = json.load(rf)
+    config["auto_map"] = {
+        "AutoConfig": "configuration_blip2chatglm.Blip2ChatGLMConfig",
+        "AutoModel": "modeling_blip2chatglm.Blip2ChatGLMForConditionalGeneration",
+        "AutoModelForCausalLM": "modeling_blip2chatglm.Blip2ChatGLMForConditionalGeneration",
+    }
+    with (pytorch_dump_folder_path / "config.json").open("w", encoding="utf8") as wf:
+        json.dump(config, wf, indent=2, ensure_ascii=False)
+    shutil.copy(
+        "lavis/models/blip2zh_models/blip2zh_chatglm/configuration_blip2chatglm.py",
+        pytorch_dump_folder_path / "configuration_blip2chatglm.py",
+    )
+    shutil.copy(
+        "lavis/models/blip2zh_models/blip2zh_chatglm/modeling_blip2chatglm.py",
+        pytorch_dump_folder_path / "modeling_blip2chatglm.py",
+    )
+    shutil.copy(
+        "lavis/models/blip2zh_models/blip2zh_chatglm/configuration_chatglm.py",
+        pytorch_dump_folder_path / "configuration_chatglm.py",
+    )
+    shutil.copy(
+        "lavis/models/blip2zh_models/blip2zh_chatglm/modeling_chatglm.py",
+        pytorch_dump_folder_path / "modeling_chatglm.py",
+    )
+
+    params, total_size = count_parameters(hf_model)
     # rich.print(params)
-    # rich.print(f"Total size: {total_size}")
-
+    rich.print(f"Total size: {total_size}")
 
     # if push_to_hub:
     #     processor.push_to_hub(f"nielsr/{model_name}")
@@ -243,6 +309,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     choices = [
         "blip2zh-chatglm-6b",
+        "blip2zh-chatglm-6b-vqa",
     ]
     parser.add_argument(
         "--model_name",
@@ -251,7 +318,12 @@ if __name__ == "__main__":
         type=str,
         help="Path to hf config.json of model to convert",
     )
-    parser.add_argument("--pytorch_dump_folder_path", default=None, type=str, help="Path to the output PyTorch model.")
+    parser.add_argument(
+        "--pytorch_dump_folder_path",
+        default=None,
+        type=str,
+        help="Path to the output PyTorch model.",
+    )
     parser.add_argument(
         "--push_to_hub",
         action="store_true",
@@ -260,4 +332,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    convert_blip2zh_checkpoint(args.model_name, args.pytorch_dump_folder_path, args.push_to_hub)
+    convert_blip2zh_checkpoint(
+        args.model_name, args.pytorch_dump_folder_path, args.push_to_hub
+    )

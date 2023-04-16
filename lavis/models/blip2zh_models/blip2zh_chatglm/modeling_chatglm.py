@@ -55,7 +55,7 @@ class InvalidScoreLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         if torch.isnan(scores).any() or torch.isinf(scores).any():
             scores.zero_()
-            scores[..., 20005] = 5e4
+            scores[..., 5] = 5e4
         return scores
 
 
@@ -280,10 +280,8 @@ def attention_fn(
     # [sk, b, np, hn] -> [sk, b * np, hn]
     key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-    matmul_result = torch.empty(
-        output_size[0] * output_size[1],
-        output_size[2],
-        output_size[3],
+    matmul_result = torch.zeros(
+        1, 1, 1,
         dtype=query_layer.dtype,
         device=query_layer.device,
     )
@@ -348,10 +346,18 @@ def attention_fn(
     return outputs
 
 
+def default_init(cls, *args, **kwargs):
+    return cls(*args, **kwargs)
+
+
 class SelfAttention(torch.nn.Module):
     def __init__(self, hidden_size, num_attention_heads,
                  layer_id, hidden_size_per_attention_head=None, bias=True,
-                 params_dtype=torch.float, position_encoding_2d=True):
+                 params_dtype=torch.float, position_encoding_2d=True, empty_init=True):
+        if empty_init:
+            init_method = skip_init
+        else:
+            init_method = default_init
         super(SelfAttention, self).__init__()
 
         self.layer_id = layer_id
@@ -379,7 +385,7 @@ class SelfAttention(torch.nn.Module):
         self.inner_hidden_size = num_attention_heads * self.hidden_size_per_attention_head
 
         # Strided linear layer.
-        self.query_key_value = skip_init(
+        self.query_key_value = init_method(
             torch.nn.Linear,
             hidden_size,
             3 * self.inner_hidden_size,
@@ -387,7 +393,7 @@ class SelfAttention(torch.nn.Module):
             dtype=params_dtype,
         )
 
-        self.dense = skip_init(
+        self.dense = init_method(
             torch.nn.Linear,
             self.inner_hidden_size,
             hidden_size,
@@ -500,8 +506,12 @@ class GEGLU(torch.nn.Module):
 
 class GLU(torch.nn.Module):
     def __init__(self, hidden_size, inner_hidden_size=None,
-                 layer_id=None, bias=True, activation_func=gelu, params_dtype=torch.float):
+                 layer_id=None, bias=True, activation_func=gelu, params_dtype=torch.float, empty_init=True):
         super(GLU, self).__init__()
+        if empty_init:
+            init_method = skip_init
+        else:
+            init_method = default_init
         self.layer_id = layer_id
         self.activation_func = activation_func
 
@@ -510,7 +520,7 @@ class GLU(torch.nn.Module):
         if inner_hidden_size is None:
             inner_hidden_size = 4 * hidden_size
         self.inner_hidden_size = inner_hidden_size
-        self.dense_h_to_4h = skip_init(
+        self.dense_h_to_4h = init_method(
             torch.nn.Linear,
             self.hidden_size,
             self.inner_hidden_size,
@@ -518,7 +528,7 @@ class GLU(torch.nn.Module):
             dtype=params_dtype,
         )
         # Project back to h.
-        self.dense_4h_to_h = skip_init(
+        self.dense_4h_to_h = init_method(
             torch.nn.Linear,
             self.inner_hidden_size,
             self.hidden_size,
@@ -554,7 +564,8 @@ class GLMBlock(torch.nn.Module):
             use_bias=True,
             params_dtype=torch.float,
             num_layers=28,
-            position_encoding_2d=True
+            position_encoding_2d=True,
+            empty_init=True
     ):
         super(GLMBlock, self).__init__()
         # Set output layer initialization if not provided.
@@ -574,7 +585,8 @@ class GLMBlock(torch.nn.Module):
             hidden_size_per_attention_head=hidden_size_per_attention_head,
             bias=use_bias,
             params_dtype=params_dtype,
-            position_encoding_2d=self.position_encoding_2d
+            position_encoding_2d=self.position_encoding_2d,
+            empty_init=empty_init
         )
 
         # Layernorm on the input data.
@@ -589,6 +601,7 @@ class GLMBlock(torch.nn.Module):
             bias=use_bias,
             layer_id=layer_id,
             params_dtype=params_dtype,
+            empty_init=empty_init
         )
 
     def forward(
@@ -676,8 +689,10 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
 
         return attention_mask
 
-    def get_position_ids(self, input_ids, mask_positions, device, gmask=False):
+    def get_position_ids(self, input_ids, mask_positions, device, use_gmasks=None):
         batch_size, seq_length = input_ids.shape
+        if use_gmasks is None:
+            use_gmasks = [False] * batch_size
         context_lengths = [seq.tolist().index(self.config.bos_token_id) for seq in input_ids]
         if self.position_encoding_2d:
             position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
@@ -691,8 +706,8 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
             position_ids = torch.stack((position_ids, block_position_ids), dim=1)
         else:
             position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-            if not gmask:
-                for i, context_length in enumerate(context_lengths):
+            for i, context_length in enumerate(context_lengths):
+                if not use_gmasks[i]:
                     position_ids[context_length:] = mask_positions[i]
 
         return position_ids
@@ -783,9 +798,12 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
     `encoder_hidden_states` is then expected as an input to the forward pass.
     """
 
-    def __init__(self, config: ChatGLMConfig):
+    def __init__(self, config: ChatGLMConfig, empty_init=True):
         super().__init__(config)
-
+        if empty_init:
+            init_method = skip_init
+        else:
+            init_method = default_init
         # recording parameters
         self.max_sequence_length = config.max_sequence_length
         self.hidden_size = config.hidden_size
@@ -800,7 +818,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.pre_seq_len = config.pre_seq_len
         self.prefix_projection = config.prefix_projection
 
-        self.word_embeddings = skip_init(
+        self.word_embeddings = init_method(
             torch.nn.Embedding,
             num_embeddings=self.vocab_size, embedding_dim=self.hidden_size,
             dtype=self.params_dtype
@@ -819,6 +837,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 use_bias=True,
                 params_dtype=self.params_dtype,
                 position_encoding_2d=self.position_encoding_2d,
+                empty_init=empty_init
             )
 
         self.layers = torch.nn.ModuleList(
@@ -894,12 +913,18 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 )
                 use_cache = False
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
+        # if input_ids is not None and inputs_embeds is not None:
+        #     raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        # elif input_ids is not None:
+        #     batch_size, seq_length = input_ids.shape[:2]
+        # elif inputs_embeds is not None:
+        #     batch_size, seq_length. _ = inputs_embeds.shape[:2]
+        # else:
+        #     raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
-            # NOTE: fix
             batch_size, seq_length = inputs_embeds.shape[:2]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
@@ -923,15 +948,20 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
 
             if position_ids is None:
                 MASK, gMASK = self.config.mask_token_id, self.config.gmask_token_id
-                mask_token = gMASK if gMASK in input_ids else MASK
-                use_gmask = True if gMASK in input_ids else False
+                seqs = input_ids.tolist()
 
-                mask_positions = [seq.tolist().index(mask_token) for seq in input_ids]
+                mask_positions, use_gmasks = [], []
+                for seq in seqs:
+                    mask_token = gMASK if gMASK in seq else MASK
+                    use_gmask = mask_token == gMASK
+                    mask_positions.append(seq.index(mask_token))
+                    use_gmasks.append(use_gmask)
+
                 position_ids = self.get_position_ids(
                     input_ids,
                     mask_positions=mask_positions,
                     device=input_ids.device,
-                    gmask=use_gmask
+                    use_gmasks=use_gmasks
                 )
 
         if self.pre_seq_len is not None and attention_mask is not None:
@@ -950,10 +980,10 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.zeros(1, 1, device=input_ids.device).bool()
 
-        else:
-            pass
-            # NOTE: this is a hack to make the code work with the LAVIS training
-            # attention_mask = attention_mask.to(input_ids.device)
+        # NOTE: this is a hack to make the code work with the LAVIS training
+        # else:
+        #     pass
+        #     attention_mask = attention_mask.to(input_ids.device)
 
         for i, layer in enumerate(self.layers):
 
@@ -1009,8 +1039,12 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
 
 
 class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
-    def __init__(self, config: ChatGLMConfig):
+    def __init__(self, config: ChatGLMConfig, empty_init=True):
         super().__init__(config)
+        if empty_init:
+            init_method = skip_init
+        else:
+            init_method = default_init
 
         # self.hidden_size = config.hidden_size
         # self.params_dtype = torch.half
@@ -1019,9 +1053,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         self.position_encoding_2d = config.position_encoding_2d
 
-        self.transformer = ChatGLMModel(config)
+        self.transformer = ChatGLMModel(config, empty_init=empty_init)
 
-        self.lm_head = skip_init(
+        self.lm_head = init_method(
             nn.Linear,
             config.hidden_size,
             config.vocab_size,
@@ -1080,7 +1114,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     def prepare_inputs_for_generation(
             self,
             input_ids: torch.LongTensor,
-            inputs_embeds: Optional[torch.Tensor] = None,
             past: Optional[torch.Tensor] = None,
             past_key_values: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
@@ -1089,10 +1122,13 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     ) -> dict:
         batch_size, seq_length = input_ids.shape
         MASK, gMASK = self.config.mask_token_id, self.config.gmask_token_id
-        mask_token = gMASK if gMASK in input_ids else MASK
-        use_gmask = True if gMASK in input_ids else False
         seqs = input_ids.tolist()
-        mask_positions = [seq.index(mask_token) for seq in seqs]
+        mask_positions, use_gmasks = [], []
+        for seq in seqs:
+            mask_token = gMASK if gMASK in seq else MASK
+            use_gmask = mask_token == gMASK
+            mask_positions.append(seq.index(mask_token))
+            use_gmasks.append(use_gmask)
 
         # only last token for input_ids if past is not None
         if past is not None or past_key_values is not None:
@@ -1135,23 +1171,15 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     input_ids,
                     device=input_ids.device,
                     mask_positions=mask_positions,
-                    gmask=use_gmask
+                    use_gmasks=use_gmasks
                 )
-            if inputs_embeds is not None:
-                assert input_ids.size(1) == inputs_embeds.size(1), f"Make sure that both input_ids ({input_ids.size(1)}) and inputs_embeds ({inputs_embeds.size(1)}) have the same length."
-                return {
-                    "inputs_embeds": inputs_embeds,
-                    "past_key_values": past,
-                    "position_ids": position_ids,
-                    "attention_mask": attention_mask
-                }
-            else:
-                return {
-                    "input_ids": input_ids,
-                    "past_key_values": past,
-                    "position_ids": position_ids,
-                    "attention_mask": attention_mask
-                }
+
+            return {
+                "input_ids": input_ids,
+                "past_key_values": past,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask
+            }
 
     def forward(
             self,

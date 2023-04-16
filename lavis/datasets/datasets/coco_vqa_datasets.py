@@ -30,6 +30,42 @@ class __DisplMixin:
         )
 
 
+class COCOZhVQADataset(VQADataset, __DisplMixin):
+    def __init__(self, vis_processor, text_processor, vis_root, ann_paths):
+        super().__init__(vis_processor, text_processor, vis_root, ann_paths)
+
+    def __getitem__(self, index):
+        ann = self.annotation[index]
+
+        image_path = os.path.join(self.vis_root, ann["image"])
+        image = Image.open(image_path).convert("RGB")
+
+        image = self.vis_processor(image)
+        question = self.text_processor(ann["question"])
+        answer = self.text_processor(ann["answer"])
+
+        return {
+            "image": image,
+            "text_input": question,
+            "answer": answer,
+        }
+
+    def collater(self, samples):
+        import torch
+        image_list, question_list, answer_list = [], [], []
+
+        for sample in samples:
+            image_list.append(sample["image"])
+            question_list.append(sample["text_input"])
+            answer_list.append(sample["answer"])
+
+        return {
+            "image": torch.stack(image_list, dim=0),
+            "text_input": question_list,
+            "answer": answer_list,
+        }
+
+
 class COCOVQADataset(VQADataset, __DisplMixin):
     def __init__(self, vis_processor, text_processor, vis_root, ann_paths):
         super().__init__(vis_processor, text_processor, vis_root, ann_paths)
