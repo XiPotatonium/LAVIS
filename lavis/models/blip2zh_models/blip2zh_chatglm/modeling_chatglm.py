@@ -913,15 +913,6 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 )
                 use_cache = False
 
-        # if input_ids is not None and inputs_embeds is not None:
-        #     raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        # elif input_ids is not None:
-        #     batch_size, seq_length = input_ids.shape[:2]
-        # elif inputs_embeds is not None:
-        #     batch_size, seq_length. _ = inputs_embeds.shape[:2]
-        # else:
-        #     raise ValueError("You have to specify either input_ids or inputs_embeds")
-
         if input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
@@ -979,11 +970,6 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.zeros(1, 1, device=input_ids.device).bool()
-
-        # NOTE: this is a hack to make the code work with the LAVIS training
-        # else:
-        #     pass
-        #     attention_mask = attention_mask.to(input_ids.device)
 
         for i, layer in enumerate(self.layers):
 
@@ -1109,11 +1095,16 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 [position_ids, new_position_id], dim=-1
             )
 
+        # set to None as prepare_inputs_for_generation use past for input embeds
+        if "inputs_embeds" in model_kwargs:
+            model_kwargs["inputs_embeds"] = None
+
         return model_kwargs
 
     def prepare_inputs_for_generation(
             self,
             input_ids: torch.LongTensor,
+            inputs_embeds: Optional[torch.Tensor] = None,
             past: Optional[torch.Tensor] = None,
             past_key_values: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
@@ -1174,12 +1165,23 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     use_gmasks=use_gmasks
                 )
 
-            return {
-                "input_ids": input_ids,
-                "past_key_values": past,
-                "position_ids": position_ids,
-                "attention_mask": attention_mask
-            }
+            if inputs_embeds is not None:
+                assert input_ids.size(1) == inputs_embeds.size(
+                    1
+                ), f"Make sure that both input_ids ({input_ids.size(1)}) and inputs_embeds ({inputs_embeds.size(1)}) have the same length."
+                return {
+                    "inputs_embeds": inputs_embeds,
+                    "past_key_values": past,
+                    "position_ids": position_ids,
+                    "attention_mask": attention_mask,
+                }
+            else:
+                return {
+                    "input_ids": input_ids,
+                    "past_key_values": past,
+                    "position_ids": position_ids,
+                    "attention_mask": attention_mask,
+                }
 
     def forward(
             self,

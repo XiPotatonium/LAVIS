@@ -1,13 +1,16 @@
 import copy
 import os
 from typing import Callable, List, Optional, Tuple, Union
+import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
+from torch.nn.utils.rnn import pad_sequence
 import warnings
 from torch import Tensor, nn
 
 from transformers import (
     PreTrainedModel,
+    PreTrainedTokenizer,
     Blip2VisionModel,
     Blip2QFormerModel,
     Blip2Model,
@@ -137,12 +140,14 @@ class Blip2ChatGLMForConditionalGeneration(Blip2ForConditionalGeneration):
         if image_slot_offset is None:
             # image as prefix
             # update data to avoid inplace operation of leaf Variable
-            inputs_embeds.data[:, : self.config.num_query_tokens, :] = language_model_inputs
+            inputs_embeds.data[
+                :, : self.config.num_query_tokens, :
+            ] = language_model_inputs
         else:
             for i, offset in enumerate(image_slot_offset):
-                inputs_embeds.data[i, offset : offset + self.config.num_query_tokens, :] = (
-                    language_model_inputs[i]
-                )
+                inputs_embeds.data[
+                    i, offset : offset + self.config.num_query_tokens, :
+                ] = language_model_inputs[i]
 
         outputs = self.language_model(
             input_ids=input_ids,
@@ -181,116 +186,199 @@ class Blip2ChatGLMForConditionalGeneration(Blip2ForConditionalGeneration):
             language_model_outputs=outputs,
         )
 
+    def prepare_inputs_for_chat(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        queries: List[Union[str, Tuple[str, torch.Tensor]]],
+        histories: List[List[Tuple[Union[str, Tuple[str, torch.Tensor]], str]]],
+        max_length: int,
+    ):
+        device = self.device
+        nvtokens = self.config.num_query_tokens
+        # 1. Prepare token ids
+        all_images = []
+        all_image_slots = []
+        all_input_ids = []
+        for query, history in zip(queries, histories):
+            image_slots = []
+
+            if history:
+                input_ids = tokenizer(
+                    f"[Round {len(history)}]\n问：", add_special_tokens=False
+                ).input_ids
+                slot_offset = len(input_ids)
+                if isinstance(query, tuple):
+                    qtext, qimg = query
+                    # image slot, embedding will be replaced by image embeddings
+                    input_ids.extend([tokenizer.unk_token_id] * nvtokens)
+                else:
+                    qtext = query
+                    qimg = None
+                input_ids += tokenizer(qtext + f"\n答：").input_ids
+                if qimg is not None:
+                    all_images.append(qimg)
+                    image_slots.append(
+                        len(input_ids) - slot_offset
+                    )  # count from backward
+
+                for ri, (q, r) in enumerate(reversed(history)):
+                    if len(input_ids) >= max_length:
+                        break
+                    i = len(history) - ri - 1
+                    cur_input_ids: List[int] = tokenizer(
+                        f"[Round {i}]\n问：", add_special_tokens=False
+                    ).input_ids
+                    slot_offset = len(cur_input_ids)
+                    if isinstance(q, tuple):
+                        qtext, qimg = q
+                        # image slot, embedding will be replaced by image embeddings
+                        cur_input_ids.extend([tokenizer.unk_token_id] * nvtokens)
+                    else:
+                        qtext = q
+                        qimg = None
+                    cur_input_ids += tokenizer(
+                        qtext + f"\n答：{r}\n", add_special_tokens=False
+                    ).input_ids
+                    input_ids = cur_input_ids + input_ids
+                    if qimg is not None:
+                        all_images.append(qimg)
+                        image_slots.append(
+                            len(input_ids) - slot_offset
+                        )  # count from backward
+            else:
+                input_ids = []
+                if isinstance(query, tuple):
+                    qtext, qimg = query
+                    # image slot, embedding will be replaced by image embeddings
+                    input_ids.extend([tokenizer.unk_token_id] * nvtokens)
+                else:
+                    qtext = query
+                    qimg = None
+                input_ids += tokenizer(qtext).input_ids
+                if qimg is not None:
+                    all_images.append(qimg)
+                    image_slots.append(len(input_ids))  # count from backward
+
+            if len(input_ids) >= max_length:
+                # truncate
+                if (
+                    image_slots[-1] > max_length
+                    and image_slots[-1] - nvtokens < max_length
+                ):
+                    # A non-intact image slot is not allowed
+                    input_ids = input_ids[-(image_slots[-1] - nvtokens) :]
+                else:
+                    input_ids = input_ids[-max_length:]
+                if image_slots[-1] > max_length:
+                    image_slots.pop()
+                    all_images.pop()
+
+            all_image_slots.append(image_slots)
+            all_input_ids.append(input_ids)
+
+        # 2. Prepare image embeddings
+        if len(all_images) != 0:
+            vision_outputs = self.vision_model.forward(torch.cat(all_images, dim=0))
+            all_image_embeds = vision_outputs[0]
+            indices_or_sections = [len(chunk) for chunk in all_image_slots]
+            indices_or_sections = np.cumsum(indices_or_sections)
+            all_vtokens = []
+            # TODO: qformer not batched
+            for image_embeds in torch.tensor_split(
+                all_image_embeds, tuple(indices_or_sections)
+            ):
+                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
+                    device
+                )
+
+                query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+                query_outputs = self.qformer.forward(
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                )
+                query_output = query_outputs[0]
+
+                all_vtokens.append(self.language_projection(query_output))
+        else:
+            all_vtokens = None
+
+        # 3. Place image embeddings into slots
+        input_ids = (
+            torch.ones(
+                (len(all_input_ids), max(len(ids) for ids in all_input_ids)),
+                dtype=torch.long,
+            )
+            * tokenizer.pad_token_id
+        )
+        for i, ids in enumerate(all_input_ids):
+            # pad left
+            input_ids[i][-len(ids) :] = torch.as_tensor(ids, dtype=torch.long)
+        input_ids = input_ids.to(device)
+        inputs_embeds = self.language_model.transformer.word_embeddings(input_ids)
+        for i, (image_slots, vtokens) in enumerate(zip(all_image_slots, all_vtokens)):
+            for slot, vimg in zip(image_slots, vtokens):
+                inputs_embeds[i][-slot : -slot + nvtokens, :] = vimg
+
+        return input_ids, inputs_embeds
+
+    @torch.no_grad()
+    def batch_chat(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        queries: List[Union[str, Tuple[str, torch.Tensor]]],
+        histories: List[List[Tuple[Union[str, Tuple[str, torch.Tensor]], str]]],
+        max_length: int = 2048,
+        num_beams=1,
+        do_sample=True,
+        top_p=0.7,
+        temperature=0.95,
+        logits_processor=None,
+        **kwargs,
+    ):
+        input_ids, inputs_embeds = self.prepare_inputs_for_chat(
+            tokenizer, queries, histories, max_length
+        )
+
+        if logits_processor is None:
+            logits_processor = LogitsProcessorList()
+        logits_processor.append(InvalidScoreLogitsProcessor())
+        gen_kwargs = {
+            "max_length": max_length,
+            "num_beams": num_beams,
+            "do_sample": do_sample,
+            "top_p": top_p,
+            "temperature": temperature,
+            "logits_processor": logits_processor,
+            **kwargs,
+        }
+
+        outputs = self.language_model.generate(
+            input_ids=input_ids, inputs_embeds=inputs_embeds, **gen_kwargs
+        )
+        responses = []
+        for i, output in enumerate(outputs.tolist()):
+            output = output[len(input_ids[i]) :]
+            response = tokenizer.decode(output)
+            responses.append(self.language_model.process_response(response))
+        return responses
+
     @torch.no_grad()
     def stream_chat(
         self,
-        tokenizer,
+        tokenizer: PreTrainedTokenizer,
         query: Union[str, Tuple[str, torch.Tensor]],
-        history: List[Tuple[Union[str, Tuple[str, torch.Tensor]], str]] = [],
+        history: List[Tuple[Union[str, Tuple[str, torch.Tensor]], str]],
         num_beams=5,
         max_length=128,
         top_p=0.9,
         do_sample=True,
         temperature=1,
+        **kwargs,
     ):
-        device = self.device
-        # 1. Prepare token ids
-        images = []
-        image_slots = []
-
-        nvtokens = self.config.num_query_tokens
-        if history:
-            input_ids = tokenizer(
-                f"[Round {len(history)}]\n问：", add_special_tokens=False
-            ).input_ids
-            slot_offset = len(input_ids)
-            if isinstance(query, tuple):
-                qtext, qimg = query
-                # image slot, embedding will be replaced by image embeddings
-                input_ids.extend([tokenizer.unk_token_id] * nvtokens)
-            else:
-                qtext = query
-                qimg = None
-            input_ids += tokenizer(qtext + f"\n答：").input_ids
-            if qimg is not None:
-                images.append(qimg)
-                image_slots.append(len(input_ids) - slot_offset)  # count from backward
-
-            for ri, (q, r) in enumerate(reversed(history)):
-                if len(input_ids) >= max_length:
-                    break
-                i = len(history) - ri - 1
-                cur_input_ids: List[int] = tokenizer(
-                    f"[Round {i}]\n问：", add_special_tokens=False
-                ).input_ids
-                slot_offset = len(cur_input_ids)
-                if isinstance(q, tuple):
-                    qtext, qimg = q
-                    # image slot, embedding will be replaced by image embeddings
-                    cur_input_ids.extend([tokenizer.unk_token_id] * nvtokens)
-                else:
-                    qtext = q
-                    qimg = None
-                cur_input_ids += tokenizer(
-                    qtext + f"\n答：{r}\n", add_special_tokens=False
-                ).input_ids
-                input_ids = cur_input_ids + input_ids
-                if qimg is not None:
-                    images.append(qimg)
-                    image_slots.append(
-                        len(input_ids) - slot_offset
-                    )  # count from backward
-        else:
-            input_ids = []
-            if isinstance(query, tuple):
-                qtext, qimg = query
-                # image slot, embedding will be replaced by image embeddings
-                input_ids.extend([tokenizer.unk_token_id] * nvtokens)
-            else:
-                qtext = query
-                qimg = None
-            input_ids += tokenizer(qtext).input_ids
-            if qimg is not None:
-                images.append(qimg)
-                image_slots.append(len(input_ids))  # count from backward
-
-        if len(input_ids) >= max_length:
-            # truncate
-            if image_slots[-1] > max_length and image_slots[-1] - nvtokens < max_length:
-                # A non-intact image slot is not allowed
-                input_ids = input_ids[-(image_slots[-1] - nvtokens) :]
-            else:
-                input_ids = input_ids[-max_length:]
-            if image_slots[-1] > max_length:
-                image_slots.pop()
-                images.pop()
-
-        # 2. Prepare image embeddings
-        if len(images) != 0:
-            image = torch.cat(list(images), dim=0)
-            vision_outputs = self.vision_model.forward(image)
-            image_embeds = vision_outputs[0]
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-                device
-            )
-
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            query_outputs = self.qformer.forward(
-                query_embeds=query_tokens,
-                encoder_hidden_states=image_embeds,
-                encoder_attention_mask=image_atts,
-            )
-            query_output = query_outputs[0]
-
-            vtokens = self.language_projection(query_output)
-        else:
-            vtokens = []
-
-        # 3. Place image embeddings into slots
-        input_ids = torch.as_tensor(input_ids, dtype=torch.long).to(device).unsqueeze(0)
-        inputs_embeds = self.language_model.transformer.word_embeddings(input_ids)
-        for slot, vimg in zip(image_slots, vtokens):
-            inputs_embeds[0][-slot : -slot + nvtokens, :] = vimg
+        input_ids, inputs_embeds = self.prepare_inputs_for_chat(
+            tokenizer, [query], [history], max_length
+        )
 
         logits_processor = LogitsProcessorList()
         logits_processor.append(InvalidScoreLogitsProcessor())
@@ -301,265 +389,13 @@ class Blip2ChatGLMForConditionalGeneration(Blip2ForConditionalGeneration):
             "top_p": top_p,
             "temperature": temperature,
             "logits_processor": logits_processor,
+            **kwargs,
         }
 
-        for outputs in self.stream_generate(
+        for outputs in self.language_model.stream_generate(
             input_ids=input_ids, inputs_embeds=inputs_embeds, **gen_kwargs
         ):
             outputs = outputs.tolist()[0][len(input_ids[0]) :]
             response = tokenizer.decode(outputs)
             response = self.language_model.process_response(response)
             yield response
-
-    @torch.no_grad()
-    def stream_generate(
-        self,
-        input_ids,
-        inputs_embeds,
-        generation_config: Optional[GenerationConfig] = None,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        prefix_allowed_tokens_fn: Optional[
-            Callable[[int, torch.Tensor], List[int]]
-        ] = None,
-        **kwargs,
-    ):
-        """slightly modified from chatglm implementation to support inputs_embeds
-
-        Args:
-            input_ids (_type_): _description_
-            inputs_embeds (_type_): _description_
-            generation_config (Optional[GenerationConfig], optional): _description_. Defaults to None.
-            logits_processor (Optional[LogitsProcessorList], optional): _description_. Defaults to None.
-            stopping_criteria (Optional[StoppingCriteriaList], optional): _description_. Defaults to None.
-            prefix_allowed_tokens_fn (Optional[ Callable[[int, torch.Tensor], List[int]] ], optional): _description_. Defaults to None.
-
-        Yields:
-            _type_: _description_
-        """
-        batch_size, input_ids_seq_length = input_ids.shape[0], input_ids.shape[-1]
-
-        if generation_config is None:
-            generation_config = self.language_model.generation_config
-        generation_config = copy.deepcopy(generation_config)
-        model_kwargs = generation_config.update(**kwargs)
-        bos_token_id, eos_token_id = (
-            generation_config.bos_token_id,
-            generation_config.eos_token_id,
-        )
-
-        if isinstance(eos_token_id, int):
-            eos_token_id = [eos_token_id]
-
-        has_default_max_length = (
-            kwargs.get("max_length") is None
-            and generation_config.max_length is not None
-        )
-        if has_default_max_length and generation_config.max_new_tokens is None:
-            warnings.warn(
-                f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
-                "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
-                " recommend using `max_new_tokens` to control the maximum length of the generation.",
-                UserWarning,
-            )
-        elif generation_config.max_new_tokens is not None:
-            generation_config.max_length = (
-                generation_config.max_new_tokens + input_ids_seq_length
-            )
-            if not has_default_max_length:
-                logger.warn(
-                    f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
-                    f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
-                    "Please refer to the documentation for more information. "
-                    "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)",
-                    UserWarning,
-                )
-
-        if input_ids_seq_length >= generation_config.max_length:
-            input_ids_string = (
-                "decoder_input_ids"
-                if self.language_model.config.is_encoder_decoder
-                else "input_ids"
-            )
-            logger.warning(
-                f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
-                f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
-                " increasing `max_new_tokens`."
-            )
-
-        # 2. Set generation parameters if not already defined
-        logits_processor = (
-            logits_processor if logits_processor is not None else LogitsProcessorList()
-        )
-        stopping_criteria = (
-            stopping_criteria
-            if stopping_criteria is not None
-            else StoppingCriteriaList()
-        )
-
-        logits_processor = self.language_model._get_logits_processor(
-            generation_config=generation_config,
-            input_ids_seq_length=input_ids_seq_length,
-            encoder_input_ids=input_ids,
-            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-            logits_processor=logits_processor,
-        )
-
-        stopping_criteria = self.language_model._get_stopping_criteria(
-            generation_config=generation_config, stopping_criteria=stopping_criteria
-        )
-        logits_warper = self.language_model._get_logits_warper(generation_config)
-
-        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
-        scores = None
-        while True:
-            model_inputs = self.prepare_inputs_for_generation(
-                input_ids, inputs_embeds=inputs_embeds, **model_kwargs
-            )
-            # forward pass to get next token
-            outputs = self.language_model(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
-
-            next_token_logits = outputs.logits[:, -1, :]
-
-            # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-            next_token_scores = logits_warper(input_ids, next_token_scores)
-
-            # sample
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            if generation_config.do_sample:
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(probs, dim=-1)
-
-            # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            inputs_embeds = torch.cat(
-                [
-                    inputs_embeds,
-                    self.language_model.get_input_embeddings()(next_tokens)[:, None, :],
-                ],
-                dim=1,
-            )
-            model_kwargs = self.language_model._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=self.language_model.config.is_encoder_decoder,
-            )
-            unfinished_sequences = unfinished_sequences.mul(
-                (sum(next_tokens != i for i in eos_token_id)).long()
-            )
-
-            # stop when each sentence is finished, or if we exceed the maximum length
-            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
-                break
-            yield input_ids
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        past: Optional[torch.Tensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> dict:
-        """slightly modified from chatglm implementation to support inputs_embeds
-
-        Args:
-            input_ids (torch.LongTensor): _description_
-            inputs_embeds (Optional[torch.Tensor], optional): _description_. Defaults to None.
-            past (Optional[torch.Tensor], optional): _description_. Defaults to None.
-            past_key_values (Optional[torch.Tensor], optional): _description_. Defaults to None.
-            attention_mask (Optional[torch.Tensor], optional): _description_. Defaults to None.
-            position_ids (Optional[torch.Tensor], optional): _description_. Defaults to None.
-
-        Returns:
-            dict: _description_
-        """
-        batch_size, seq_length = input_ids.shape
-        MASK, gMASK = self.language_model.config.mask_token_id, self.language_model.config.gmask_token_id
-        seqs = input_ids.tolist()
-        mask_positions, use_gmasks = [], []
-        for seq in seqs:
-            mask_token = gMASK if gMASK in seq else MASK
-            use_gmask = mask_token == gMASK
-            mask_positions.append(seq.index(mask_token))
-            use_gmasks.append(use_gmask)
-
-        # only last token for input_ids if past is not None
-        if past is not None or past_key_values is not None:
-            last_token = input_ids[:, -1].unsqueeze(-1)
-            if attention_mask is not None and attention_mask.dtype == torch.bool:
-                attention_mask = attention_mask[:, :, -1:]
-            else:
-                attention_mask = None
-            if position_ids is not None:
-                position_ids = position_ids[..., -1:]
-            else:
-                context_lengths = [seq.index(self.language_model.config.bos_token_id) for seq in seqs]
-                if self.language_model.position_encoding_2d:
-                    position_ids = torch.tensor(
-                        [
-                            [mask_position, seq_length - context_length]
-                            for mask_position, context_length in zip(
-                                mask_positions, context_lengths
-                            )
-                        ],
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    ).unsqueeze(-1)
-                else:
-                    position_ids = torch.tensor(
-                        [mask_position for mask_position in mask_positions],
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    ).unsqueeze(-1)
-
-            if past is None:
-                past = past_key_values
-            return {
-                "input_ids": last_token,
-                "past_key_values": past,
-                "position_ids": position_ids,
-                "attention_mask": attention_mask,
-            }
-        else:
-            if attention_mask is not None and attention_mask.dtype != torch.bool:
-                logger.warning_once(
-                    f"The dtype of attention mask ({attention_mask.dtype}) is not bool"
-                )
-                attention_mask = None
-            if attention_mask is None:
-                attention_mask = self.language_model.get_masks(input_ids, device=input_ids.device)
-            if position_ids is None:
-                position_ids = self.language_model.get_position_ids(
-                    input_ids,
-                    device=input_ids.device,
-                    mask_positions=mask_positions,
-                    use_gmasks=use_gmasks,
-                )
-
-            if inputs_embeds is not None:
-                assert input_ids.size(1) == inputs_embeds.size(
-                    1
-                ), f"Make sure that both input_ids ({input_ids.size(1)}) and inputs_embeds ({inputs_embeds.size(1)}) have the same length."
-                return {
-                    "inputs_embeds": inputs_embeds,
-                    "past_key_values": past,
-                    "position_ids": position_ids,
-                    "attention_mask": attention_mask,
-                }
-            else:
-                return {
-                    "input_ids": input_ids,
-                    "past_key_values": past,
-                    "position_ids": position_ids,
-                    "attention_mask": attention_mask,
-                }
